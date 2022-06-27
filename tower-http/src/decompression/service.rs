@@ -1,12 +1,13 @@
-use super::{DecompressionBody, DecompressionLayer, ResponseFuture};
-use crate::compression_utils::AcceptEncoding;
+use super::{DecompressionBody, DecompressionLayer, ResponseFuture, body::BodyInner};
+use crate::compression_utils::{AcceptEncoding, WrapBody};
 use http::{
-    header::{self, ACCEPT_ENCODING},
+    header::{self, ACCEPT_ENCODING, CONTENT_ENCODING},
     Request, Response,
 };
 use http_body::Body;
 use std::task::{Context, Poll};
 use tower_service::Service;
+use crate::content_encoding::SupportedEncodings;
 
 /// Decompresses response bodies of the underlying service.
 ///
@@ -86,8 +87,9 @@ impl<S> Decompression<S> {
 
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for Decompression<S>
 where
-    S: Service<Request<ReqBody>, Response = Response<ResBody>>,
+    S: Service<Request<DecompressionBody<ReqBody>>, Response = Response<ResBody>>,
     ResBody: Body,
+    ReqBody: Body,
 {
     type Response = Response<DecompressionBody<ResBody>>;
     type Error = S::Error;
@@ -103,9 +105,32 @@ where
                 entry.insert(accept);
             }
         }
+        let request;
+        if let Some(header) = req.headers().get(CONTENT_ENCODING) {
+            request = match header.as_bytes() {
+                #[cfg(feature = "decompression-gzip")]
+                b"gzip" if self.accept.gzip() => {
+                    req.map(|body| DecompressionBody::new(BodyInner::gzip(WrapBody::new(body))))
+                }
+
+                #[cfg(feature = "decompression-deflate")]
+                b"deflate" if self.accept.deflate() => {
+                    req.map(|body| DecompressionBody::new(BodyInner::deflate(WrapBody::new(body))))
+                }
+
+                #[cfg(feature = "decompression-br")]
+                b"br" if self.accept.br() => {
+                    req.map(|body| DecompressionBody::new(BodyInner::brotli(WrapBody::new(body))))
+                }
+
+                _ => { req.map(|body| DecompressionBody::new(BodyInner::identity(body))) }
+            };
+        } else {
+            request = req.map(|body| DecompressionBody::new(BodyInner::identity(body)));
+        }
 
         ResponseFuture {
-            inner: self.inner.call(req),
+            inner: self.inner.call(request),
             accept: self.accept,
         }
     }
